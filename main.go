@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"reflect"
 	"strings"
 
 	"gopkg.in/yaml.v2"
@@ -33,14 +34,8 @@ type PlaybookSource struct {
 	path  string
 }
 
-// DirtyPlaybook object can be used to manipulate and (un)marshal its data.
-type DirtyPlaybook yaml.MapSlice
-
-// CleanPlaybook does not contain dynamic elements.
-type CleanPlaybook yaml.MapSlice
-
-func UnmarshalPlaybook(playbook []byte) (DirtyPlaybook, error) {
-	var data []DirtyPlaybook
+func UnmarshalPlaybook(playbook []byte) (yaml.MapSlice, error) {
+	var data []yaml.MapSlice
 	if err := yaml.Unmarshal(playbook, &data); err != nil {
 		return nil, err
 	}
@@ -54,14 +49,14 @@ func UnmarshalPlaybook(playbook []byte) (DirtyPlaybook, error) {
 	return data[0], nil
 }
 
-// GetExclusions extracts dynamic keys that are meant to be excluded from the playbook hash.
-func (p *DirtyPlaybook) GetExclusions() ([][]string, error) {
+// GetPlaybookExclusions extracts dynamic keys that are meant to be excluded from the playbook hash.
+func GetPlaybookExclusions(p *yaml.MapSlice) ([][]string, error) {
 	rawExclusions := ""
 	for _, item := range *p {
 		if item.Key.(string) != "vars" {
 			continue
 		}
-		vars := item.Value.(DirtyPlaybook)
+		vars := item.Value.(yaml.MapSlice)
 		for _, pair := range vars {
 			if pair.Key.(string) != "insights_signature_exclude" {
 				continue
@@ -83,85 +78,70 @@ func (p *DirtyPlaybook) GetExclusions() ([][]string, error) {
 	return exclusions, nil
 }
 
-func (p *DirtyPlaybook) Clean() (*CleanPlaybook, error) {
-	exclusions, err := p.GetExclusions()
+func CleanPlaybook(p *yaml.MapSlice) (*yaml.MapSlice, error) {
+	exclusions, err := GetPlaybookExclusions(p)
 	if err != nil {
 		return nil, err
 	}
 
-	clean := CleanPlaybook{}
+	clean := yaml.MapSlice{}
 	for _, directValue := range *p {
 		directValueName := directValue.Key.(string)
 		skipDirectValue := false
 
-		// exclusion of top-level/direct values
-		for _, exclusion := range exclusions {
-			if directValueName == exclusion[0] && len(exclusion) == 1 {
-				skipDirectValue = true
+		if reflect.TypeOf(directValue.Value) == reflect.TypeOf(yaml.MapSlice{}) {
+			// nested exclusion
+			newDirectValue := yaml.MapSlice{}
+
+			for _, nestedValue := range directValue.Value.(yaml.MapSlice) {
+				nestedValueName := nestedValue.Key.(string)
+				skipNestedValue := false
+
+				for _, exclusion := range exclusions {
+					if directValueName == exclusion[0] && len(exclusion) == 2 && nestedValueName == exclusion[1] {
+						skipNestedValue = true
+					}
+				}
+
+				if skipNestedValue {
+					slog.Info("excluding nested", slog.String("path", directValueName+"/"+nestedValueName))
+					continue
+				}
+
+				slog.Debug("including nested", slog.String("path", directValueName+"/"+nestedValueName))
+				newDirectValue = append(newDirectValue, yaml.MapItem{Key: nestedValue.Key, Value: nestedValue.Value})
+			}
+
+			directValue = yaml.MapItem{Key: directValue.Key, Value: newDirectValue}
+		} else {
+			// simple exclusion
+			for _, exclusion := range exclusions {
+				if directValueName == exclusion[0] && len(exclusion) == 1 {
+					skipDirectValue = true
+				}
+			}
+			if skipDirectValue {
+				slog.Info("excluding direct", slog.String("path", directValueName))
+				continue
 			}
 		}
-		if skipDirectValue {
-			slog.Debug("excluding", slog.String("path", directValue.Key.(string)))
-			continue
-		}
 
-		// exclusion of nested values
-		// TODO
-
+		slog.Debug("including direct", slog.String("path", directValueName))
 		clean = append(clean, directValue)
 	}
+
+	slog.Debug("playbook cleaned")
 	return &clean, nil
 }
 
-// Marshall takes in the playbook and marshals it into a string
+// MarshallPlaybook takes in the playbook and marshals it into a string
 // as per the requirements of the hashing scheme.
-func (p *CleanPlaybook) Marshall() ([]byte, error) {
+func MarshallPlaybook(p *yaml.MapSlice) ([]byte, error) {
 	// TODO dict as ...
 	// TODO list as ...
 	// TODO ...
 
 	return []byte{}, nil
-}
-
-// cleanPlaybook deletes specific keys from the playbook.
-//
-// Some parts of the Ansible playbook are dynamic (e.g. hosts, the signature) and cannot be
-// signed, because the signature would be unique for every playbook that is generated.
-//
-// This function removes these variable sections.
-func cleanPlaybook(p *DirtyPlaybook) (*CleanPlaybook, error) {
-	playbook := CleanPlaybook{}
-	for _, v := range *p {
-		playbook = append(playbook, yaml.MapItem{Key: v.Key, Value: v.Value})
-	}
-
-	for _, exclusion := range []string{} {
-		var elements []string
-		for _, element := range strings.Split(exclusion, "/") {
-			if len(element) == 0 {
-				continue
-			}
-			elements = append(elements, element)
-		}
-
-		// elements[0] has to be key explicitly allowed to be excluded
-		if _, ok := DynamicLabels[elements[0]]; !ok {
-			return nil, VerificationError{
-				fmt.Sprintf("key '%s' is not allowed to be excluded", exclusion),
-			}
-		}
-
-		// simple key deletion
-		if len(elements) == 1 {
-			slog.Debug("deleted dynamic key", "key", exclusion)
-		}
-		// nested key deletion
-		if len(elements) == 2 {
-			slog.Debug("deleted dynamic key", "key", exclusion)
-		}
-	}
-
-	return &playbook, nil
 }
 
 // NewPlaybookSource detects the location for the playbook.
@@ -171,7 +151,7 @@ func cleanPlaybook(p *DirtyPlaybook) (*CleanPlaybook, error) {
 func NewPlaybookSource() PlaybookSource {
 	path := os.Getenv("PLAYBOOK_SOURCE")
 	source := PlaybookSource{stdin: path == "", path: path}
-	slog.Debug("determined playbook source:", slog.Any("source", source))
+	slog.Debug("determined playbook source", slog.Any("source", source))
 	return source
 }
 
@@ -203,13 +183,13 @@ func main() {
 	}
 
 	// Delete dynamic elements
-	clean, err := dirty.Clean()
+	clean, err := CleanPlaybook(&dirty)
 	if err != nil {
 		slog.Error("could not clean playbook", slog.Any("error", err))
 	}
-	fmt.Println("clean", clean)
 
 	// Serialize it
+	_, _ = MarshallPlaybook(clean)
 
 	// Create a hash
 
@@ -238,6 +218,6 @@ func readPlaybook(source PlaybookSource) ([]byte, error) {
 		rawPlaybook = playbook
 	}
 
-	slog.Debug("playbook obtained", slog.Int("bytes", len(rawPlaybook)))
+	slog.Debug("playbook loaded")
 	return rawPlaybook, nil
 }
