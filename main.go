@@ -134,16 +134,6 @@ func CleanPlaybook(p *yaml.MapSlice) (*yaml.MapSlice, error) {
 	return &clean, nil
 }
 
-// MarshallPlaybook takes in the playbook and marshals it into a string
-// as per the requirements of the hashing scheme.
-func MarshallPlaybook(p *yaml.MapSlice) ([]byte, error) {
-	// TODO dict as ...
-	// TODO list as ...
-	// TODO ...
-
-	return []byte{}, nil
-}
-
 // NewPlaybookSource detects the location for the playbook.
 //
 // If environment variable `PLAYBOOK_SOURCE` is set, it is interpreted as a path on a filesystem.
@@ -189,7 +179,11 @@ func main() {
 	}
 
 	// Serialize it
-	_, _ = MarshallPlaybook(clean)
+	serialized, err := MarshallPlaybook(clean)
+	if err != nil {
+		slog.Error("could not serialize playbook", slog.Any("error", err))
+	}
+	fmt.Println(string(serialized))
 
 	// Create a hash
 
